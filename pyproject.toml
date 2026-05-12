@@ -11,3 +11,8 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "trafilatura>=2.0.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]

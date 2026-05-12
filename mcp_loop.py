@@ -81,7 +81,10 @@ async def agent(
 async def main():
     print(f"[start] {datetime.now().isoformat(timespec='seconds')}")
     async with AsyncExitStack() as stack:
-        # Spawn every MCP server as a subprocess and open a session to each
+        # Spawn every MCP server as a subprocess and open a session to each.
+        # TODO: when we add a third server, lift this routing dict + the loop
+        # below into a small MCPRouter class (owns the ExitStack, exposes
+        # .tools and .call(name, input)). Two servers isn't worth the abstraction yet.
         tool_to_session: dict[str, ClientSession] = {}
         all_tools: list[dict] = []
 

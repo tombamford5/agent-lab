@@ -1,9 +1,7 @@
 """MCP server: fetch a URL, extract main text, summarise via Claude Haiku."""
 import json
 import time
-import urllib.robotparser
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx
 import trafilatura
@@ -22,24 +20,6 @@ TIMEOUT_SECONDS = 10.0
 MAX_TEXT_CHARS = 50_000
 SUMMARISER_MODEL = "claude-haiku-4-5-20251001"
 ALLOWED_CONTENT_TYPES = ("text/html", "text/plain", "application/xhtml+xml")
-
-
-def _robots_allows(url: str) -> bool:
-    """Return True if robots.txt permits fetching url (fail-open on errors)."""
-    parsed = urlparse(url)
-    if not parsed.scheme or not parsed.netloc:
-        return False
-    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
-    try:
-        with httpx.Client(timeout=5.0, headers={"User-Agent": USER_AGENT}) as client:
-            resp = client.get(robots_url)
-    except httpx.HTTPError:
-        return True
-    if resp.status_code >= 400:
-        return True
-    rp = urllib.robotparser.RobotFileParser()
-    rp.parse(resp.text.splitlines())
-    return rp.can_fetch(USER_AGENT, url)
 
 
 def _fetch_html(url: str) -> str:
@@ -83,10 +63,10 @@ def read_url(url: str) -> dict[str, Any]:
     """Fetch a URL and extract its main text content (strips nav/ads/boilerplate).
 
     Returns a dict with: url, title, text, author, date, truncated.
-    On failure returns {"error": "..."}.
+    If the page loads but has no extractable main text (JS-rendered SPA, login
+    wall, etc.) the dict includes a "warning" field and an empty "text".
+    On fetch failure returns {"error": "..."}.
     """
-    if not _robots_allows(url):
-        return {"error": f"disallowed by robots.txt or invalid url: {url}"}
     try:
         html = _fetch_html(url)
     except Exception as e:
@@ -100,7 +80,15 @@ def read_url(url: str) -> dict[str, Any]:
         include_comments=False,
     )
     if not extracted:
-        return {"error": "no main content found"}
+        # Main text extraction failed; fall back to metadata-only so the agent
+        # still gets the title and can decide whether to retry / give up / proceed.
+        meta = trafilatura.extract_metadata(html, default_url=url)
+        return {
+            "url": url,
+            "title": meta.title if meta else None,
+            "text": "",
+            "warning": "no main text extracted",
+        }
 
     data = json.loads(extracted)
     text = (data.get("text") or "").strip()
