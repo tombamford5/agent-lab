@@ -1,6 +1,7 @@
-"""Agent loop that gets its tools from an MCP server. Stage 2 of the lab."""
+"""Agent loop that gets its tools from one or more MCP servers. Stage 2 of the lab."""
 import asyncio
 import json
+from contextlib import AsyncExitStack
 from datetime import datetime
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -10,6 +11,11 @@ from mcp.client.stdio import stdio_client
 load_dotenv()
 anthropic = Anthropic()
 MODEL = "claude-opus-4-7"
+
+SERVERS = [
+    ("notes", ["uv", "run", "python", "notes_server.py"]),
+    ("web-fetcher", ["uv", "run", "python", "web_fetcher_server.py"]),
+]
 
 
 def mcp_tools_to_anthropic(mcp_tools) -> list[dict]:
@@ -24,16 +30,15 @@ def mcp_tools_to_anthropic(mcp_tools) -> list[dict]:
     ]
 
 
-async def agent(session: ClientSession, user_prompt: str, max_turns: int = 10) -> str:
-    # Step 1: ask the MCP server what tools it has, translate them for Claude
-    tools_result = await session.list_tools()
-    tools = mcp_tools_to_anthropic(tools_result.tools)
-    print(f"[setup] MCP server exposes {len(tools)} tools: "
-          f"{[t['name'] for t in tools]}\n")
-
+async def agent(
+    tool_to_session: dict[str, ClientSession],
+    tools: list[dict],
+    user_prompt: str,
+    max_turns: int = 10,
+) -> str:
     messages = [{"role": "user", "content": user_prompt}]
 
-    for turn in range(max_turns):
+    for _ in range(max_turns):
         resp = anthropic.messages.create(
             model=MODEL,
             max_tokens=4096,
@@ -49,10 +54,13 @@ async def agent(session: ClientSession, user_prompt: str, max_turns: int = 10) -
             tool_results = []
             for block in resp.content:
                 if block.type == "tool_use":
-                    print(f"[tool] {block.name}({json.dumps(block.input)})")
-                    # Step 2: route the call through MCP, not a local dispatcher
+                    # Truncate input echo so a huge summarise_text(text=...) doesn't flood the log
+                    shown = json.dumps(block.input)
+                    if len(shown) > 200:
+                        shown = shown[:200] + "..."
+                    print(f"[tool] {block.name}({shown})")
+                    session = tool_to_session[block.name]
                     result = await session.call_tool(block.name, block.input)
-                    # MCP results come back as a list of content blocks; flatten to text
                     output = "\n".join(
                         c.text for c in result.content if hasattr(c, "text")
                     )
@@ -72,22 +80,33 @@ async def agent(session: ClientSession, user_prompt: str, max_turns: int = 10) -
 
 async def main():
     print(f"[start] {datetime.now().isoformat(timespec='seconds')}")
-    # Spawn the MCP server as a subprocess and talk to it over stdio
-    params = StdioServerParameters(
-        command="uv",
-        args=["run", "python", "notes_server.py"],
-    )
-    async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as session:
+    async with AsyncExitStack() as stack:
+        # Spawn every MCP server as a subprocess and open a session to each
+        tool_to_session: dict[str, ClientSession] = {}
+        all_tools: list[dict] = []
+
+        for label, cmd in SERVERS:
+            params = StdioServerParameters(command=cmd[0], args=cmd[1:])
+            read, write = await stack.enter_async_context(stdio_client(params))
+            session = await stack.enter_async_context(ClientSession(read, write))
             await session.initialize()
 
-            prompt = (
-                "Add three notes: 'learn MCP', 'build agent loop', 'connect them'. "
-                "Then list all notes and tell me how many there are."
-            )
-            answer = await agent(session, prompt)
-            print("─" * 60)
-            print(answer)
+            tools_result = await session.list_tools()
+            anthropic_tools = mcp_tools_to_anthropic(tools_result.tools)
+            for t in tools_result.tools:
+                tool_to_session[t.name] = session
+            all_tools.extend(anthropic_tools)
+            print(f"[setup] {label}: {[t['name'] for t in anthropic_tools]}")
+
+        print(f"[setup] {len(all_tools)} tools total across {len(SERVERS)} servers\n")
+
+        prompt = (
+            "Fetch https://modelcontextprotocol.io, summarise it in about 150 words, "
+            "then save the summary as a note. Confirm when done."
+        )
+        answer = await agent(tool_to_session, all_tools, prompt)
+        print("─" * 60)
+        print(answer)
 
 
 if __name__ == "__main__":
